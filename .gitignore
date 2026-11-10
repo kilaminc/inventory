@@ -1,0 +1,10 @@
+.gradle/
+.kotlin/
+**/build/
+local.properties
+backend/runtime/
+__pycache__/
+.env
+*.jks
+*.keystore
+.DS_Store
