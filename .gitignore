@@ -8,3 +8,5 @@ __pycache__/
 *.jks
 *.keystore
 .DS_Store
+
+node_modules/

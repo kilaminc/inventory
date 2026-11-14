@@ -17,6 +17,7 @@ class InventoryTests(unittest.TestCase):
  def setUp(self):
   environment=patch.dict(os.environ,{'OPENAI_API_KEY':'','GOOGLE_SERVICE_ACCOUNT_JSON':'','GOOGLE_SHEET_ID':''})
   environment.start();self.addCleanup(environment.stop)
+  module.VISION_CACHE.clear()
   self.client=TestClient(module.app);self.client.headers['Authorization']='Bearer test-device'
   self.session=str(uuid.uuid4());self.location='A-'+self.session[:8]
   image=io.BytesIO();Image.new('RGB',(64,64),'green').save(image,'JPEG');self.image=base64.b64encode(image.getvalue()).decode()
@@ -79,6 +80,68 @@ class InventoryTests(unittest.TestCase):
   cap=self.capture();b=self.commit_body(cap);self.client.post('/api/commits',json=b)
   rows=[r for r in self.client.get('/api/stock').json() if r['location']==self.location]
   self.assertEqual([r['sku'] for r in rows],[self.sku])
+ def vision_response(self):
+  response=MagicMock()
+  result={'proposals':[dict(sku=self.sku,label='Test item',visible_packs=3,open_container=False,
+   evidence_text='Three separate sealed packs',question='')],'scene_note':'Review these visible packs.'}
+  response.json.return_value={'status':'completed','output':[{'type':'message','content':[{'type':'output_text','text':json.dumps(result)}]}]}
+  return response
+ def test_live_preview_does_not_create_evidence_or_stock(self):
+  with module.db() as c:
+   before=(c.execute('SELECT count(*) FROM captures').fetchone()[0],c.execute('SELECT count(*) FROM current_stock').fetchone()[0])
+  with patch.dict(os.environ,{'OPENAI_API_KEY':'test-key'}),patch.object(module.httpx,'Client') as client:
+   client.return_value.__enter__.return_value.post.return_value=self.vision_response()
+   result=self.client.post('/api/vision/preview',json={'image_base64':self.image})
+  self.assertEqual(result.status_code,200,result.text)
+  self.assertEqual(result.json()['proposals'][0]['visible_packs'],3)
+  with module.db() as c:
+   after=(c.execute('SELECT count(*) FROM captures').fetchone()[0],c.execute('SELECT count(*) FROM current_stock').fetchone()[0])
+  self.assertEqual(before,after)
+ def test_selected_live_view_reuses_analysis_for_saved_evidence(self):
+  with patch.dict(os.environ,{'OPENAI_API_KEY':'test-key'}),patch.object(module.httpx,'Client') as client:
+   post=client.return_value.__enter__.return_value.post
+   post.return_value=self.vision_response()
+   self.assertEqual(self.client.post('/api/vision/preview',json={'image_base64':self.image}).status_code,200)
+   cap=self.capture()
+   result=self.client.post('/api/captures/'+cap['id']+'/analyze')
+   self.assertEqual(result.status_code,200,result.text)
+   self.assertEqual(post.call_count,1)
+  photo=next(x for x in self.client.get('/api/captures').json() if x['id']==cap['id'])
+  self.assertEqual(photo['analysis']['status'],'needs_review')
+  self.assertNotIn('image_path',photo)
+ def test_live_and_photo_listing_require_device_auth(self):
+  client=TestClient(module.app)
+  self.assertEqual(client.get('/api/captures').status_code,401)
+  self.assertEqual(client.post('/api/vision/preview',json={'image_base64':self.image}).status_code,401)
+ def test_ai_billing_error_is_actionable_and_does_not_leak_response(self):
+  import httpx
+  cap=self.capture()
+  req=httpx.Request('POST','https://api.openai.com/v1/responses')
+  response=httpx.Response(429,json={'error':{'code':'insufficient_quota','message':'secret-do-not-expose'}},request=req)
+  with patch.dict(os.environ,{'OPENAI_API_KEY':'test-key'}),patch.object(module.httpx,'Client') as client:
+   client.return_value.__enter__.return_value.post.return_value=response
+   result=self.client.post('/api/captures/'+cap['id']+'/analyze')
+  self.assertEqual(result.status_code,502)
+  self.assertIn('credits',result.json()['detail'])
+  self.assertNotIn('secret-do-not-expose',result.text)
+  photo=next(x for x in self.client.get('/api/captures').json() if x['id']==cap['id'])
+  self.assertIsNone(photo['analysis'])
+  self.assertIn('credits',photo['analysis_error'])
+  with patch.dict(os.environ,{'OPENAI_API_KEY':'test-key'}),patch.object(module.httpx,'Client') as client:
+   client.return_value.__enter__.return_value.post.return_value=self.vision_response()
+   self.assertEqual(self.client.post('/api/captures/'+cap['id']+'/analyze').status_code,200)
+  photo=next(x for x in self.client.get('/api/captures').json() if x['id']==cap['id'])
+  self.assertIsNone(photo['analysis_error'])
+ def test_bad_preview_image_and_missing_configuration_are_explicit(self):
+  self.assertEqual(self.client.post('/api/vision/preview',json={'image_base64':'not-a-real-image'}).status_code,422)
+  result=self.client.post('/api/vision/preview',json={'image_base64':self.image})
+  self.assertEqual(result.status_code,503)
+  self.assertIn('OPENAI_API_KEY',result.json()['detail'])
+ def test_live_camera_page_is_available_without_embedding_credentials(self):
+  result=TestClient(module.app).get('/capture')
+  self.assertEqual(result.status_code,200)
+  self.assertIn('Start live video + AI',result.text)
+  self.assertNotIn('test-device',result.text)
  def sheet_client(self):
   import sheets
   fake=MagicMock()

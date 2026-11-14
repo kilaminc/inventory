@@ -33,3 +33,13 @@ Retry the same commit ID with identical content after uncertain network outcomes
 ## Deployment limits
 
 This is a single-process SQLite/persistent-disk pilot. For multiple concurrent sites/devices at scale, migrate to Postgres, object storage and an explicit conflict-resolution UI. The shared device token is sufficient for a small controlled pilot; it does not provide individual access revocation or staff identity verification.
+
+
+## Browser capture (0.2.0)
+- `GET /capture` and `GET /capture.js`: public UI shell; no business data or credentials embedded.
+- `GET /api/captures?limit=30`: authenticated recent photo metadata, analyses, and sanitized analysis errors (limit 1–100).
+- `POST /api/vision/preview`: authenticated `{image_base64}` request. Returns a proposed count from a sampled live frame without saving evidence or changing stock.
+- `POST /api/captures/{id}/analyze`: retains existing behavior, with actionable errors for authentication, quota, model access, timeout and malformed results. Failures remain retryable.
+- `GET /api/status`: adds uploaded/analyzed photo totals and the latest unresolved sanitized analysis error. Configured flags indicate key presence, not a successful external API call.
+
+The bounded 120-second in-memory analysis cache stores results only. Selecting the same live frame as saved photo evidence can reuse its result. The cache is scoped by image, catalogue identity fields, OCR/barcodes and model. It does not bypass count review.

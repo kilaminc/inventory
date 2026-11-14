@@ -31,3 +31,15 @@ Install the APK on Android 8 or newer. Enter the HTTPS backend URL and shared de
 In `backend`, install `requirements.txt` and run `python -m unittest discover -s tests -v`.
 
 The pilot preserves evidence and uses one reviewed final quantity per SKU and shelf. Repeat uploads do not add counts; unvisited items are not set to zero. Cloud AI, Google Sheets permissions and warehouse camera accuracy require live configuration and device testing. See `docs/API.md` for API details.
+
+## Live video and photos in the browser (0.2.0)
+
+Open `/capture` on the deployed HTTPS service and enter the existing device code. Live mode opens the rear camera and analyzes one changed frame at a time, with an eight-second gap after each result. It stops on errors, when the page is hidden, and when the operator starts review. This is sampled-frame AI over a continuous camera preview, not video recording or object tracking. Camera access and physical-device performance still require on-device verification.
+
+Live previews do not create evidence or change stock. Choose **Review this view** to save the selected frame and review quantities. **Take / choose photo** uploads and analyzes a still photo immediately. Previously uploaded Android photos appear in **Uploaded photos** with retryable analysis errors. Empty AI results explicitly explain why no packages were counted.
+
+Confirmed counts replace the same SKU at the same shelf; they are never summed across frames. A final confirmation is required before committing stock and syncing Sheets. Pending commit retries reuse the same ID and body. Draft final counts persist in this browser; preview images do not. Voice corrections depend on browser speech-recognition support and remain editable before confirmation.
+
+The APK remains the existing 0.1.0 pilot; this release adds browser capture without requiring an APK reinstall.
+
+Run backend tests with `cd backend && python -m unittest discover -s tests -v`. Run browser-logic tests with `cd backend && npm install && npm test` (Node 22 or newer). The JavaScript tests use simulated camera and network responses; they do not prove physical camera or live cloud accuracy.
