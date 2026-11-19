@@ -31,7 +31,7 @@ DATA.mkdir(parents=True, exist_ok=True)
 DB = DATA / 'inventory.sqlite3'
 LOCK = threading.RLock()
 Image.MAX_IMAGE_PIXELS = 30_000_000
-app = FastAPI(title='Healthy Tiffin Inventory', version='0.2.0')
+app = FastAPI(title='Healthy Tiffin Inventory', version='0.2.1')
 VISION_SLOTS = threading.BoundedSemaphore(2)
 VISION_CACHE = OrderedDict()
 VISION_CACHE_LOCK = threading.Lock()
@@ -80,6 +80,7 @@ def initialize():
           created_at TEXT NOT NULL, sheets_synced_at TEXT);
         CREATE TABLE IF NOT EXISTS analysis_failures(capture_id TEXT PRIMARY KEY,
           message TEXT NOT NULL, updated_at TEXT NOT NULL);
+        CREATE TABLE IF NOT EXISTS deleted_captures(id TEXT PRIMARY KEY, deleted_at TEXT NOT NULL);
         CREATE TABLE IF NOT EXISTS current_stock(location TEXT NOT NULL, sku TEXT NOT NULL,
           quantity REAL NOT NULL, unit TEXT NOT NULL, source TEXT NOT NULL,
           counted_at TEXT NOT NULL, operator TEXT NOT NULL, commit_id TEXT NOT NULL,
@@ -143,7 +144,7 @@ def item_list():
 
 @app.get('/health')
 def health():
-    return {'ok': True, 'version': '0.2.0'}
+    return {'ok': True, 'version': '0.2.1'}
 
 @app.get('/api/status', dependencies=[Depends(auth)])
 def status():
@@ -199,6 +200,8 @@ def capture(body: Capture):
     digest = hashlib.sha256(raw).hexdigest()
     meta = body.model_dump(mode='json', exclude={'image_base64'})
     with db() as c:
+        if c.execute('SELECT id FROM deleted_captures WHERE id=?', (cid,)).fetchone():
+            raise HTTPException(410, 'This photo was deleted. Take a new photo instead of retrying this upload.')
         old = c.execute('SELECT * FROM captures WHERE id=?', (cid,)).fetchone()
         if old:
             if old['image_hash'] != digest or json.loads(old['input']) != meta:
@@ -220,6 +223,33 @@ def recent_captures(limit: int = Query(default=30, ge=1, le=100)):
     return [{**{k:r[k] for k in ('id','session_id','location','operator','captured_at')},
              'analysis':json.loads(r['analysis']) if r['analysis'] else None,
              'analysis_error':r['message']} for r in rows]
+
+@app.delete('/api/captures/{cid}', dependencies=[Depends(auth)])
+def delete_capture(cid: uuid.UUID):
+    key = str(cid)
+    with db() as c:
+        row = c.execute('SELECT id FROM captures WHERE id=?', (key,)).fetchone()
+        deleted = c.execute('SELECT id FROM deleted_captures WHERE id=?', (key,)).fetchone()
+        if not row and not deleted:
+            raise HTTPException(404, 'Photo not found')
+        # Retain only a tombstone so an offline device cannot resurrect this upload.
+        # Saved count records remain unchanged even when their photo is removed.
+        path = DATA / 'evidence' / (key + '.jpg')
+        try:
+            path.unlink(missing_ok=True)
+        except OSError:
+            raise HTTPException(503, 'The photo could not be deleted. Please retry.') from None
+        c.execute('INSERT OR IGNORE INTO deleted_captures VALUES (?,?)', (key, now()))
+        c.execute('DELETE FROM analysis_failures WHERE capture_id=?', (key,))
+        c.execute('DELETE FROM captures WHERE id=?', (key,))
+        for item_row in c.execute('SELECT sku,body FROM items').fetchall():
+            item = json.loads(item_row['body'])
+            if item.get('reference_photo') == key:
+                item['reference_photo'] = ''
+                c.execute('UPDATE items SET body=? WHERE sku=?', (json.dumps(item), item_row['sku']))
+    with VISION_CACHE_LOCK:
+        VISION_CACHE.clear()
+    return {'id': key, 'deleted': True}
 
 def match_candidates(meta, catalog):
     tokens = set(re.findall(r'[a-z0-9]+', meta.get('ocr', '').lower()))
@@ -340,13 +370,16 @@ def live_preview(body: LiveFrame):
 def analyze(cid: uuid.UUID):
     with db() as c:
         row = c.execute('SELECT * FROM captures WHERE id=?', (str(cid),)).fetchone()
-    if not row: raise HTTPException(404, 'Capture not found')
-    if row['analysis']: return json.loads(row['analysis'])
+        if not row: raise HTTPException(404, 'Photo not found. It may have been deleted.')
+        if row['analysis']: return json.loads(row['analysis'])
+        jpeg = Path(row['image_path']).read_bytes()
     catalog = item_list(); meta = json.loads(row['input'])
     try:
-        result = analyze_photo(Path(row['image_path']).read_bytes(), meta, catalog)
+        result = analyze_photo(jpeg, meta, catalog)
     except HTTPException as exc:
         with db() as c:
+            if not c.execute('SELECT id FROM captures WHERE id=?', (str(cid),)).fetchone():
+                raise HTTPException(404, 'Photo was deleted during analysis.') from None
             c.execute('INSERT INTO analysis_failures VALUES (?,?,?) ON CONFLICT(capture_id) DO UPDATE SET '
                       'message=excluded.message,updated_at=excluded.updated_at',(str(cid),exc.detail,now()))
         if exc.status_code == 503:
@@ -354,15 +387,20 @@ def analyze(cid: uuid.UUID):
                     'scene_note':exc.detail}
         raise
     with db() as c:
+        if not c.execute('SELECT id FROM captures WHERE id=?', (str(cid),)).fetchone():
+            raise HTTPException(404, 'Photo was deleted during analysis.')
         c.execute('UPDATE captures SET analysis=? WHERE id=?', (json.dumps(result),str(cid)))
         c.execute('DELETE FROM analysis_failures WHERE capture_id=?',(str(cid),))
     return result
 
 @app.get('/api/evidence/{cid}', dependencies=[Depends(auth)])
 def evidence(cid: uuid.UUID):
-    path=DATA/'evidence'/(str(cid)+'.jpg')
-    if not path.exists(): raise HTTPException(404,'Photo not found')
-    return FileResponse(path, media_type='image/jpeg')
+    with db() as c:
+        path=DATA/'evidence'/(str(cid)+'.jpg')
+        if not c.execute('SELECT id FROM captures WHERE id=?', (str(cid),)).fetchone() or not path.exists():
+            raise HTTPException(404,'Photo not found. It may have been deleted.')
+        jpeg = path.read_bytes()
+    return Response(jpeg, media_type='image/jpeg', headers={'Cache-Control':'no-store'})
 
 @app.post('/api/commits', dependencies=[Depends(auth)])
 def commit(body: Commit):
@@ -384,7 +422,7 @@ def commit(body: Commit):
             for eid in line.evidence_ids:
                 evidence=c.execute('SELECT session_id,location FROM captures WHERE id=?',(str(eid),)).fetchone()
                 if not evidence or evidence['session_id']!=str(body.session_id) or evidence['location']!=body.location:
-                    raise HTTPException(422,'Evidence must belong to this shelf session.')
+                    raise HTTPException(422,'The photo for '+line.sku+' is missing, deleted, or belongs to another shelf. Remove this unsaved count and review a new photo.')
             previous=c.execute('SELECT counted_at FROM current_stock WHERE location=? AND sku=?',
                                (body.location,line.sku)).fetchone()
             if previous and body.counted_at <= datetime.fromisoformat(previous['counted_at']):

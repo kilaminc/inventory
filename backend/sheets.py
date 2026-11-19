@@ -37,12 +37,14 @@ def sync(db, items, data_dir):
                 ['sku','name','category','subcategory','unit','barcode','pack_size','pack_unit','notes']])
             obs=[['Commit ID','Counted at','Operator','Location','SKU','Item','Quantity','Unit','Method','Evidence IDs','Evidence link','Note']]
             used=set(); baseurl=os.getenv('PUBLIC_BASE_URL','').rstrip('/')
+            available_photos={x['id'] for x in captures}
             for record in commits:
                 x=json.loads(record['body'])
                 for line in x['lines']:
                     used.update(line['evidence_ids'])
                     ids=line['evidence_ids']
-                    link=baseurl+'/view/evidence/'+ids[0] if baseurl and ids else ''
+                    available_ids=[cid for cid in ids if cid in available_photos]
+                    link=baseurl+'/view/evidence/'+available_ids[0] if baseurl and available_ids else ''
                     obs.append([x['id'],x['counted_at'],x['operator'],x['location'],line['sku'],names.get(line['sku'],''),
                         line['quantity'],line['unit'],line['source'],', '.join(ids),link,line.get('note','')])
             current=[['Location','SKU','Item','Quantity','Unit','Method','Counted at','Operator','Commit ID']]

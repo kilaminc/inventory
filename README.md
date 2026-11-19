@@ -43,3 +43,7 @@ Confirmed counts replace the same SKU at the same shelf; they are never summed a
 The APK remains the existing 0.1.0 pilot; this release adds browser capture without requiring an APK reinstall.
 
 Run backend tests with `cd backend && python -m unittest discover -s tests -v`. Run browser-logic tests with `cd backend && npm install && npm test` (Node 22 or newer). The JavaScript tests use simulated camera and network responses; they do not prove physical camera or live cloud accuracy.
+
+
+## Delete an uploaded photo (0.2.1)
+Open `/capture`, connect, then choose **Delete photo** in **Uploaded photos** or beside the currently reviewed photo. Confirm the location and time before deleting. Saved stock quantities remain unchanged; unsaved counts using that photo are removed from this browser draft. The app also updates Google Sheets, or displays a sync-retry message. Copies in the phone gallery or original Android app remain on the phone. This update does not require an APK reinstall.

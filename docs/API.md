@@ -43,3 +43,10 @@ This is a single-process SQLite/persistent-disk pilot. For multiple concurrent s
 - `GET /api/status`: adds uploaded/analyzed photo totals and the latest unresolved sanitized analysis error. Configured flags indicate key presence, not a successful external API call.
 
 The bounded 120-second in-memory analysis cache stores results only. Selecting the same live frame as saved photo evidence can reuse its result. The cache is scoped by image, catalogue identity fields, OCR/barcodes and model. It does not bypass count review.
+
+
+## Photo deletion (0.2.1)
+- `DELETE /api/captures/{id}`: requires the device token. Removes the uploaded JPEG, capture metadata, cached analysis and failure entry. Clears catalogue reference-photo fields pointing at it. Returns `{id, deleted: true}`; repeating a completed deletion is safe.
+- Saved commits and stock quantities are preserved. Their evidence IDs remain as history; deleted photos cannot support a new count. Sheets sync removes the deleted photo from HT Review and removes unavailable evidence links from HT Observations without changing quantities.
+- A minimal ID/deletion-time tombstone prevents offline upload retries from restoring a deleted photo (`410 Gone`). The original image on the phone or in the APK is outside the scope of this endpoint.
+- The browser asks for confirmation, removes affected unsaved draft counts, clears the selected photo, and attempts Sheets sync. A sync failure does not undo deletion. Pending uncertain commits must be resolved first. Definitive count-validation failures unlock editing; network failures retain the original commit for safe retry.

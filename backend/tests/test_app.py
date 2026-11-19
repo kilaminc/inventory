@@ -35,6 +35,60 @@ class InventoryTests(unittest.TestCase):
  def test_capture_retry_and_collision(self):
   b=self.capture();self.assertEqual(self.client.post('/api/captures',json=b).status_code,200)
   b['location']='Other';self.assertEqual(self.client.post('/api/captures',json=b).status_code,409)
+ def test_photo_delete_requires_auth_and_unknown_ids_do_not_create_tombstones(self):
+  cap=self.capture();url='/api/captures/'+cap['id']
+  self.assertEqual(TestClient(module.app).delete(url).status_code,401)
+  self.assertEqual(self.client.get('/api/evidence/'+cap['id']).status_code,200)
+  unknown=str(uuid.uuid4())
+  self.assertEqual(self.client.delete('/api/captures/'+unknown).status_code,404)
+  self.assertEqual(self.client.delete('/api/captures/not-a-uuid').status_code,422)
+  with module.db() as c:self.assertIsNone(c.execute('SELECT id FROM deleted_captures WHERE id=?',(unknown,)).fetchone())
+ def test_delete_removes_photo_analysis_and_reference_and_blocks_offline_reupload(self):
+  cap=self.capture();key=cap['id'];url='/api/captures/'+key
+  self.assertEqual(self.client.post(url+'/analyze').status_code,200)
+  original=next(i for i in module.item_list() if i['sku']==self.sku)
+  self.assertEqual(self.client.put('/api/items/'+self.sku,json={**original,'reference_photo':key}).status_code,200)
+  before=self.client.get('/api/status').json()['uploaded_photos']
+  self.assertEqual(self.client.delete(url).json(),{'id':key,'deleted':True})
+  self.assertEqual(self.client.delete(url).status_code,200)
+  self.assertEqual(self.client.get('/api/evidence/'+key).status_code,404)
+  self.assertEqual(self.client.post(url+'/analyze').status_code,404)
+  self.assertEqual(self.client.post('/api/captures',json=cap).status_code,410)
+  self.assertFalse((module.DATA/'evidence'/(key+'.jpg')).exists())
+  self.assertNotIn(key,[x['id'] for x in self.client.get('/api/captures?limit=100').json()])
+  self.assertEqual(self.client.get('/api/status').json()['uploaded_photos'],before-1)
+  self.assertEqual(next(i for i in module.item_list() if i['sku']==self.sku)['reference_photo'],'')
+  self.assertEqual(self.client.put('/api/items/'+self.sku,json={**original,'reference_photo':key}).status_code,422)
+  with module.db() as c:self.assertIsNone(c.execute('SELECT * FROM analysis_failures WHERE capture_id=?',(key,)).fetchone())
+ def test_deleting_saved_evidence_preserves_stock_and_idempotent_commits(self):
+  cap=self.capture();body=self.commit_body(cap)
+  self.assertEqual(self.client.post('/api/commits',json=body).status_code,200)
+  before=self.client.get('/api/stock').json()
+  self.assertEqual(self.client.delete('/api/captures/'+cap['id']).status_code,200)
+  self.assertEqual(self.client.get('/api/stock').json(),before)
+  self.assertTrue(self.client.post('/api/commits',json=body).json()['duplicate'])
+  self.assertEqual(self.client.post('/api/commits',json=self.commit_body(cap,7)).status_code,422)
+ def test_failed_file_delete_preserves_photo_and_all_metadata(self):
+  cap=self.capture()
+  with patch.object(module.Path,'unlink',side_effect=OSError('private-path-do-not-expose')):
+   response=self.client.delete('/api/captures/'+cap['id'])
+  self.assertEqual(response.status_code,503);self.assertNotIn('private-path',response.text)
+  self.assertEqual(self.client.get('/api/evidence/'+cap['id']).status_code,200)
+  with module.db() as c:self.assertIsNone(c.execute('SELECT id FROM deleted_captures WHERE id=?',(cap['id'],)).fetchone())
+ def test_inflight_analysis_cannot_restore_deleted_photo_or_error(self):
+  for failure in (False,True):
+   with self.subTest(failure=failure):
+    cap=self.capture();key=cap['id']
+    def analyzing(*args):
+     self.assertEqual(self.client.delete('/api/captures/'+key).status_code,200)
+     if failure:raise module.HTTPException(502,'Upstream failed')
+     return {'status':'needs_review','proposals':[],'scene_note':'test'}
+    with patch.object(module,'analyze_photo',side_effect=analyzing):
+     response=self.client.post('/api/captures/'+key+'/analyze')
+    self.assertEqual(response.status_code,404)
+    with module.db() as c:
+     self.assertIsNone(c.execute('SELECT * FROM captures WHERE id=?',(key,)).fetchone())
+     self.assertIsNone(c.execute('SELECT * FROM analysis_failures WHERE capture_id=?',(key,)).fetchone())
  def test_unconfigured_vision_does_not_invent_count(self):
   b=self.capture();r=self.client.post('/api/captures/'+b['id']+'/analyze')
   self.assertEqual(r.status_code,200);self.assertEqual(r.json()['proposals'],[])
@@ -179,5 +233,19 @@ class InventoryTests(unittest.TestCase):
   with patch.dict(sys.modules,modules),patch.dict(os.environ,{'GOOGLE_SERVICE_ACCOUNT_JSON':'{}','GOOGLE_SHEET_ID':'test'}):
    with self.assertRaises(HTTPException):sheets.sync(module.db,module.item_list(),module.DATA)
   with module.db() as db:self.assertIsNone(db.execute('SELECT sheets_synced_at FROM commits WHERE id=?',(body['id'],)).fetchone()[0])
+ def test_sheet_sync_after_deletion_keeps_counts_and_removes_photo_links_and_review(self):
+  import sheets
+  saved=self.capture();unused=self.capture();body=self.commit_body(saved)
+  self.assertEqual(self.client.post('/api/commits',json=body).status_code,200)
+  for cap in (saved,unused):self.assertEqual(self.client.delete('/api/captures/'+cap['id']).status_code,200)
+  fake,modules=self.sheet_client()
+  with patch.dict(sys.modules,modules),patch.dict(os.environ,{'GOOGLE_SERVICE_ACCOUNT_JSON':'{}','GOOGLE_SHEET_ID':'test','PUBLIC_BASE_URL':'https://inventory.example'}):
+   sheets.sync(module.db,module.item_list(),module.DATA)
+  writes=[c.kwargs['json'] for c in fake.post.call_args_list if c.args[0].endswith('/values:batchUpdate')]
+  datasets=writes[0]['data'];obs=datasets[1]['values'];stocks=datasets[2]['values'];reviews=datasets[3]['values']
+  row=next(r for r in obs if r[0]==body['id'])
+  self.assertEqual(row[6],3);self.assertEqual(row[9],saved['id']);self.assertEqual(row[10],'')
+  self.assertEqual(next(r for r in stocks if r[0]==self.location)[3],3)
+  self.assertFalse(any(r[0] in (saved['id'],unused['id']) for r in reviews))
 
 if __name__=='__main__':unittest.main()

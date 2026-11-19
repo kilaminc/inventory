@@ -69,3 +69,68 @@ test('voice rejects negative or ambiguous quantities and understands decimals',t
  assert.equal(h.w.voiceQuantity('two point five kilograms'),2.5);assert.equal(h.w.voiceQuantity('twenty five packs'),25);
  assert.equal(h.w.voiceQuantity('1,000 pieces'),1000);assert.equal(h.w.voiceQuantity('one hundred'),100);
 });
+
+function savedPhoto(h){
+ h.w.ensureShelf();
+ h.set("captureRecord={id:'photo-1',session_id:draft.session_id,location:'A1',operator:'Test operator',captured_at:'2026-11-19T12:00:00Z',uploaded:true};recent=[{...captureRecord}];resultImage='data:image/jpeg;base64,dGVzdA==';result={status:'needs_review',proposals:[],scene_note:'Test photo'}");
+ h.w.renderResult();h.w.renderHistory();
+ return h.read('captureRecord');
+}
+test('delete controls identify the photo and cancel leaves it untouched',async t=>{
+ const h=harness(t);const photo=savedPhoto(h);let message='';
+ assert.equal(h.el('deletePhoto').classList.contains('hidden'),false);
+ assert.match(h.el('history').textContent,/Delete photo/);
+ h.w.confirm=text=>{message=text;return false};
+ await h.w.deletePhoto(photo);
+ assert.match(message,/A1/);assert.match(message,/Saved stock quantities/);
+ assert.equal(h.calls.length,0);assert.equal(h.read('captureRecord.id'),'photo-1');
+});
+test('confirmed deletion clears the photo and affected drafts, preserving other counts',async t=>{
+ const h=harness(t);const photo=savedPhoto(h);
+ h.set("draft.lines=[{sku:'TEST-1',quantity:3,unit:'packs',evidence_ids:['photo-1']},{sku:'TEST-2',quantity:5,unit:'packs',evidence_ids:['photo-2']}];catalog[0].reference_photo='photo-1'");
+ h.el('confirmed').checked=true;await h.w.deletePhoto(photo);
+ assert.equal(h.calls.filter(c=>c.m==='DELETE'&&c.p==='/api/captures/photo-1').length,1);
+ assert.equal(h.calls.filter(c=>c.p==='/api/sheets/sync').length,1);
+ assert.equal(h.calls.filter(c=>c.p==='/api/commits').length,0);
+ assert.equal(h.read('captureRecord'),null);assert.equal(h.read('resultImage'),'');assert.equal(h.read('result'),null);
+ assert.equal(h.read('draft.lines.length'),1);assert.equal(h.read('draft.lines[0].sku'),'TEST-2');
+ assert.equal(h.read('catalog[0].reference_photo'),'');assert.equal(h.el('confirmed').checked,false);
+ assert.equal(h.read('recent.length'),0);assert.match(h.el('history').textContent,/No uploaded photos/);
+ assert.equal(JSON.parse(h.w.localStorage.getItem('ht_shelf_draft')).lines[0].sku,'TEST-2');
+ assert.equal(h.el('deletePhoto').classList.contains('hidden'),true);assert.match(h.el('resultHint').textContent,/Start live video/);
+});
+test('failed deletion preserves the selected photo and draft for retry',async t=>{
+ const h=harness(t);const photo=savedPhoto(h);h.set("draft.lines=[{sku:'TEST-1',quantity:3,unit:'packs',evidence_ids:['photo-1']}]");
+ h.w.api=async()=>{throw new Error('Connection interrupted')};await h.w.deletePhoto(photo);
+ assert.equal(h.read('captureRecord.id'),'photo-1');assert.equal(h.read('draft.lines.length'),1);assert.equal(h.read('recent.length'),1);
+ assert.match(h.el('message').textContent,/Retry Delete photo/);assert.equal(h.el('deletePhoto').disabled,false);
+});
+test('Sheets failure does not undo a successful photo deletion',async t=>{
+ const h=harness(t);const photo=savedPhoto(h);
+ h.w.api=async(p,m)=>{if(m==='DELETE')return {deleted:true};throw new Error('Sheets unavailable')};
+ await h.w.deletePhoto(photo);
+ assert.equal(h.read('captureRecord'),null);assert.equal(h.read('recent.length'),0);
+ assert.match(h.el('message').textContent,/Photo deleted/);assert.match(h.el('message').textContent,/Sheets update needs retry/);
+});
+test('an uncertain saved count must be resolved before deleting evidence',async t=>{
+ const h=harness(t);const photo=savedPhoto(h);h.set("draft.pending_commit={id:'commit-pending',lines:[]}");
+ let confirmed=false;h.w.confirm=()=>{confirmed=true;return true};h.w.updateControls();
+ assert.equal(h.el('deletePhoto').disabled,true);assert.ok([...h.el('history').querySelectorAll('button')].every(b=>b.disabled));
+ await h.w.deletePhoto(photo);assert.equal(confirmed,false);assert.equal(h.calls.length,0);
+ assert.match(h.el('message').textContent,/pending shelf/);
+});
+test('a late photo-list response cannot restore a deleted photo',async t=>{
+ const h=harness(t);const photo=savedPhoto(h);let resolve;
+ h.w.api=async(p)=>p.startsWith('/api/captures?')?new Promise(r=>resolve=r):{};
+ const refresh=h.w.loadRecent();await h.w.deletePhoto(photo);resolve([photo]);await refresh;
+ assert.equal(h.read('recent.length'),0);assert.match(h.el('history').textContent,/No uploaded photos/);
+});
+
+test('definitively rejected evidence unlocks counts for correction instead of trapping retries',async t=>{
+ const h=harness(t);savedPhoto(h);h.set("draft.lines=[{sku:'TEST-1',quantity:3,unit:'packs',evidence_ids:['photo-1']}]");h.el('confirmed').checked=true;
+ h.w.api=async()=>{const error=new Error('The photo is deleted. Review a new photo.');error.status=422;throw error};
+ await h.w.finishShelf();assert.equal(h.read('draft.pending_commit'),undefined);
+ assert.equal(h.read('draft.lines.length'),1);assert.equal(h.el('confirmed').checked,false);
+ assert.equal(h.el('lines').querySelector('button').disabled,false);
+ assert.match(h.el('saving').textContent,/Correct or remove/);
+});
