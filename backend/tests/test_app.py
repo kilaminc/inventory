@@ -32,6 +32,39 @@ class InventoryTests(unittest.TestCase):
    unit=self.unit,source='visual_confirmed',evidence_ids=[cap['id']],note='')])
  def test_auth(self):
   self.assertEqual(TestClient(module.app).get('/api/items').status_code,401)
+ def new_item_body(self, **overrides):
+  key=str(uuid.uuid4())
+  return {'sku':'NEW-'+key,'name':'New test ingredient '+key,'unit':'kg','category':'Produce',**overrides}
+ def test_new_item_requires_auth_and_nonblank_name_and_unit(self):
+  body=self.new_item_body()
+  self.assertEqual(TestClient(module.app).post('/api/items',json=body).status_code,401)
+  for fields in ({'name':'   '},{'name':'---'},{'unit':'   '},{'pack_size':2,'pack_unit':''}):
+   with self.subTest(fields=fields):self.assertEqual(self.client.post('/api/items',json={**body,**fields}).status_code,422)
+  self.assertNotIn(body['sku'],[i['sku'] for i in module.item_list()])
+ def test_new_item_create_and_retry_preserve_stock_and_do_not_overwrite(self):
+  cap=self.capture();body=self.new_item_body(reference_photo=cap['id'])
+  stock=self.client.get('/api/stock').json();before=len(module.item_list())
+  result=self.client.post('/api/items',json=body)
+  self.assertEqual(result.status_code,200,result.text);self.assertEqual(result.json()['name'],body['name'])
+  self.assertEqual(self.client.post('/api/items',json=body).json(),result.json())
+  self.assertEqual(len(module.item_list()),before+1)
+  self.assertEqual(self.client.get('/api/stock').json(),stock)
+  changed=self.client.post('/api/items',json={**body,'unit':'packs'})
+  self.assertEqual(changed.status_code,409);self.assertEqual(changed.json()['detail']['existing_item']['unit'],'kg')
+  self.assertEqual(next(i for i in module.item_list() if i['sku']==body['sku'])['unit'],'kg')
+ def test_normalized_duplicate_name_or_barcode_returns_existing_item(self):
+  key=str(uuid.uuid4());body=self.new_item_body(name='Café   Beans '+key,barcode='BAR-'+key)
+  self.assertEqual(self.client.post('/api/items',json=body).status_code,200)
+  for other in (self.new_item_body(name='  CAFE BEANS '+key+' '),self.new_item_body(barcode=body['barcode'])):
+   result=self.client.post('/api/items',json=other)
+   self.assertEqual(result.status_code,409,result.text)
+   self.assertEqual(result.json()['detail']['existing_item']['sku'],body['sku'])
+   self.assertNotIn(other['sku'],[i['sku'] for i in module.item_list()])
+ def test_new_item_rejects_deleted_reference_photo(self):
+  cap=self.capture();self.client.delete('/api/captures/'+cap['id'])
+  body=self.new_item_body(reference_photo=cap['id'])
+  self.assertEqual(self.client.post('/api/items',json=body).status_code,422)
+  self.assertNotIn(body['sku'],[i['sku'] for i in module.item_list()])
  def test_capture_retry_and_collision(self):
   b=self.capture();self.assertEqual(self.client.post('/api/captures',json=b).status_code,200)
   b['location']='Other';self.assertEqual(self.client.post('/api/captures',json=b).status_code,409)
@@ -247,5 +280,19 @@ class InventoryTests(unittest.TestCase):
   self.assertEqual(row[6],3);self.assertEqual(row[9],saved['id']);self.assertEqual(row[10],'')
   self.assertEqual(next(r for r in stocks if r[0]==self.location)[3],3)
   self.assertFalse(any(r[0] in (saved['id'],unused['id']) for r in reviews))
+ def test_created_item_syncs_to_ht_items_and_can_support_reviewed_count(self):
+  import sheets
+  cap=self.capture();item=self.new_item_body(reference_photo=cap['id'])
+  self.assertEqual(self.client.post('/api/items',json=item).status_code,200)
+  fake,modules=self.sheet_client()
+  with patch.dict(sys.modules,modules),patch.dict(os.environ,{'GOOGLE_SERVICE_ACCOUNT_JSON':'{}','GOOGLE_SHEET_ID':'test'}):
+   sheets.sync(module.db,module.item_list(),module.DATA)
+  write=next(c.kwargs['json'] for c in fake.post.call_args_list if c.args[0].endswith('/values:batchUpdate'))
+  row=next(r for r in write['data'][0]['values'] if r[0]==item['sku'])
+  self.assertEqual(row[1],item['name']);self.assertEqual(row[2],'Produce');self.assertEqual(row[4],'kg')
+  self.assertFalse(any(r[1]==item['sku'] for r in write['data'][2]['values']))
+  count=self.commit_body(cap,2.5);count['lines'][0].update(sku=item['sku'],unit='kg',source='operator_reported')
+  self.assertEqual(self.client.post('/api/commits',json=count).status_code,200)
+  self.assertEqual(next(r for r in self.client.get('/api/stock').json() if r['location']==self.location)['quantity'],2.5)
 
 if __name__=='__main__':unittest.main()

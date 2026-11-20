@@ -11,6 +11,7 @@ import re
 import sqlite3
 import threading
 import time
+import unicodedata
 import uuid
 from collections import OrderedDict
 from contextlib import contextmanager
@@ -31,7 +32,7 @@ DATA.mkdir(parents=True, exist_ok=True)
 DB = DATA / 'inventory.sqlite3'
 LOCK = threading.RLock()
 Image.MAX_IMAGE_PIXELS = 30_000_000
-app = FastAPI(title='Healthy Tiffin Inventory', version='0.2.1')
+app = FastAPI(title='Healthy Tiffin Inventory', version='0.2.2')
 VISION_SLOTS = threading.BoundedSemaphore(2)
 VISION_CACHE = OrderedDict()
 VISION_CACHE_LOCK = threading.Lock()
@@ -144,7 +145,7 @@ def item_list():
 
 @app.get('/health')
 def health():
-    return {'ok': True, 'version': '0.2.1'}
+    return {'ok': True, 'version': '0.2.2'}
 
 @app.get('/api/status', dependencies=[Depends(auth)])
 def status():
@@ -161,6 +162,41 @@ def status():
 @app.get('/api/items', dependencies=[Depends(auth)])
 def items():
     return item_list()
+
+def item_name_key(name):
+    value = unicodedata.normalize('NFKD', name).casefold()
+    value = ''.join(char for char in value if not unicodedata.combining(char))
+    return ' '.join(re.findall(r'[^\W_]+', value))
+
+@app.post('/api/items', dependencies=[Depends(auth)])
+def create_item(item: Item):
+    item = item.model_copy(update={
+        'name':' '.join(item.name.split()), 'unit':item.unit.strip(),
+        'category':item.category.strip() or 'Other', 'barcode':item.barcode.strip()})
+    if not item_name_key(item.name) or not item.unit:
+        raise HTTPException(422, 'Enter an item name and the unit you count it in.')
+    if item.pack_size and not item.pack_unit.strip():
+        raise HTTPException(422, 'A pack size needs a pack unit.')
+    body = item.model_dump()
+    with db() as c:
+        existing = c.execute('SELECT body FROM items WHERE sku=?', (item.sku,)).fetchone()
+        if existing:
+            old = json.loads(existing['body'])
+            if old == body:
+                return old
+            raise HTTPException(409, {'message':'This item was already saved. Use the existing item or reopen Add new item.',
+                                      'existing_item':old})
+        for row in c.execute('SELECT body FROM items'):
+            old = json.loads(row['body'])
+            same_name = item_name_key(old['name']) == item_name_key(item.name)
+            same_barcode = item.barcode and old.get('barcode') == item.barcode
+            if same_name or same_barcode:
+                raise HTTPException(409, {'message':'An item with this name or barcode already exists. Choose the existing item or enter a distinct name.',
+                                          'existing_item':old})
+        if item.reference_photo and not c.execute('SELECT id FROM captures WHERE id=?', (item.reference_photo,)).fetchone():
+            raise HTTPException(422, 'The reference photo is missing. Take or select a new photo first.')
+        c.execute('INSERT INTO items VALUES (?,?)', (item.sku, item.model_dump_json()))
+    return body
 
 @app.put('/api/items/{sku}', dependencies=[Depends(auth)])
 def save_item(sku: str, item: Item):

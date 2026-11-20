@@ -134,3 +134,74 @@ test('definitively rejected evidence unlocks counts for correction instead of tr
  assert.equal(h.el('lines').querySelector('button').disabled,false);
  assert.match(h.el('saving').textContent,/Correct or remove/);
 });
+
+function ingredientCatalogue(h){
+ h.set("catalog=[{sku:'CHICKPEAS',name:'Organic Chickpeas',unit:'kg',category:'Pantry'},{sku:'MILK',name:'Almond Milk',unit:'L',category:'Dairy alternatives'},{sku:'RICE',name:'Basmati Rice',unit:'kg',category:'Pantry'},{sku:'CUMIN',name:'Whole Cumin Seeds',unit:'kg',category:'Spices'}]");
+}
+test('unknown AI items prompt closest matches without automatically selecting an item',t=>{
+ const h=harness(t);savedPhoto(h);ingredientCatalogue(h);
+ const proposal={...h.proposal,sku:null,label:'Chikpeas'};
+ h.set('result='+JSON.stringify({status:'needs_review',proposals:[proposal],scene_note:'Review'}));h.w.renderResult();
+ assert.match(h.el('proposals').textContent,/Match or add item/);
+ h.w.openCount(proposal);
+ assert.equal(h.el('itemSearch').value,'Chikpeas');assert.equal(h.el('item').value,'');
+ assert.equal(h.el('quantity').value,'');assert.match(h.el('itemMatches').textContent,/Organic Chickpeas/);
+ assert.match(h.el('matchHint').textContent,/No exact name/);assert.equal(h.el('addNewItem').textContent,'Add new item');
+ assert.equal(h.calls.length,0);
+});
+test('closest matches rank spelling variants and require an explicit choice with correct units',t=>{
+ const h=harness(t);savedPhoto(h);ingredientCatalogue(h);
+ assert.equal(h.w.closestItems('chikpeas')[0].sku,'CHICKPEAS');assert.equal(h.w.closestItems('basmati ric')[0].sku,'RICE');
+ assert.ok(h.w.closestItems('milk').length<=3);assert.equal(h.w.closestItems('zzzzqqqqvv').length,0);
+ h.w.openCount({...h.proposal,sku:null,label:'almond milkk'});
+ h.el('itemMatches').querySelector('button').click();
+ assert.equal(h.el('item').value,'MILK');assert.equal(h.el('unit').value,'L');assert.equal(h.el('unit').readOnly,true);
+ assert.equal(h.el('quantity').value,'');assert.equal(h.calls.length,0);
+});
+test('searching after selecting an item clears stale selection and quantity',t=>{
+ const h=harness(t);savedPhoto(h);h.w.openCount(h.proposal);
+ assert.equal(h.el('item').value,'TEST-1');h.el('itemSearch').value='Completely unknown item';h.el('itemSearch').oninput();
+ assert.equal(h.el('item').value,'');assert.equal(h.el('quantity').value,'');
+});
+test('new item cancel and missing unit do not create or sync anything',async t=>{
+ const h=harness(t);savedPhoto(h);h.w.openCount({...h.proposal,sku:null,label:'New Ingredient'});h.w.openNewItem();
+ assert.equal(h.el('newItemName').value,'New Ingredient');assert.equal(h.el('newItemUnit').value,'');
+ await h.w.createCatalogItem({preventDefault(){}});assert.equal(h.calls.length,0);
+ assert.match(h.el('newItemStatus').textContent,/counting unit/);
+ h.el('cancelNewItem').click();assert.equal(h.el('newItemDialog').open,false);assert.equal(h.el('countDialog').open,true);
+});
+test('creating an item syncs Sheets and selects it without saving stock or inferring weight',async t=>{
+ const h=harness(t);savedPhoto(h);h.w.openCount({...h.proposal,sku:null,label:'New Ingredient'});h.w.openNewItem();
+ h.el('newItemUnit').value='kg';h.el('newItemCategory').value='Pantry';const calls=[];
+ h.w.api=async(p,m,body)=>{calls.push({p,m,body});return p==='/api/items'?{...body}:{synced:true}};
+ await h.w.createCatalogItem({preventDefault(){}});
+ assert.equal(calls.filter(c=>c.p==='/api/items'&&c.m==='POST').length,1);assert.equal(calls.filter(c=>c.p==='/api/sheets/sync').length,1);
+ assert.equal(calls.filter(c=>c.p==='/api/commits').length,0);assert.equal(h.read('draft.lines.length'),0);
+ assert.match(h.el('item').value,/^HT-/);assert.equal(h.el('unit').value,'kg');assert.equal(h.el('quantity').value,'');
+ assert.equal(h.el('newItemDialog').open,false);assert.match(h.el('itemStatus').textContent,/Google Sheets/);
+ h.el('quantity').value='2.5';h.w.saveLine({preventDefault(){}});assert.equal(h.read('draft.lines[0].quantity'),2.5);
+});
+test('a timed out create retries the same SKU and double clicks do not create twice',async t=>{
+ const h=harness(t);savedPhoto(h);h.w.openCount({...h.proposal,sku:null,label:'New Ingredient'});h.w.openNewItem();h.el('newItemUnit').value='packs';
+ const bodies=[];let release;
+ h.w.api=async(p,m,body)=>{if(p==='/api/items'){bodies.push(JSON.stringify(body));return new Promise((resolve,reject)=>release=()=>reject(new Error('Timed out')))}return {}};
+ const first=h.w.createCatalogItem({preventDefault(){}});await h.w.createCatalogItem({preventDefault(){}});
+ assert.equal(bodies.length,1);assert.equal(h.el('cancelNewItem').disabled,true);release();await first;
+ assert.equal(h.el('newItemDialog').open,true);assert.equal(h.el('cancelNewItem').disabled,false);
+ h.w.api=async(p,m,body)=>{if(p==='/api/items'){bodies.push(JSON.stringify(body));return body}return {synced:true}};
+ await h.w.createCatalogItem({preventDefault(){}});assert.equal(bodies.length,2);assert.equal(bodies[0],bodies[1]);
+});
+test('duplicate conflicts offer the existing item without silently choosing it',async t=>{
+ const h=harness(t);savedPhoto(h);h.w.openCount({...h.proposal,sku:null,label:'Added on another device'});h.w.openNewItem();h.el('newItemUnit').value='packs';
+ h.w.api=async()=>{const error=new Error('Item already exists');error.status=409;error.detail={existing_item:{sku:'REMOTE',name:'Added on another device',unit:'kg'}};throw error};
+ await h.w.createCatalogItem({preventDefault(){}});
+ assert.equal(h.el('item').value,'');assert.equal(h.el('newItemDialog').open,true);assert.match(h.el('newItemMatches').textContent,/Use existing/);
+ h.el('newItemMatches').querySelector('button').click();assert.equal(h.el('item').value,'REMOTE');assert.equal(h.el('unit').value,'kg');
+});
+test('a saved new item remains usable after Sheets failure',async t=>{
+ const h=harness(t);savedPhoto(h);h.w.openCount({...h.proposal,sku:null,label:'New Ingredient'});h.w.openNewItem();h.el('newItemUnit').value='packs';
+ h.w.api=async(p,m,body)=>{if(p==='/api/items')return body;throw new Error('Sheets unavailable')};
+ await h.w.createCatalogItem({preventDefault(){}});
+ assert.match(h.el('item').value,/^HT-/);assert.equal(h.el('quantity').value,'3');assert.equal(h.el('newItemDialog').open,false);
+ assert.match(h.el('itemStatus').textContent,/Item added/);assert.match(h.el('itemStatus').textContent,/needs retry/);
+});

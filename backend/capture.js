@@ -2,12 +2,13 @@
 const $=id=>document.getElementById(id);
 let token=sessionStorage.getItem('ht_device')||'',catalog=[],stream=null,live=false,liveRun=0,liveController=null;
 let actionBusy=false,connecting=false,result=null,resultImage='',captureRecord=null,proposalDraft=null;
+let itemSaving=false,newItemSku='',newItemConflict=null;
 let draft=readDraft(),recent=[],lastPixels=null,liveTimer=null,recognition=null,historyRequest=0;
 function readDraft(){try{const d=JSON.parse(localStorage.getItem('ht_shelf_draft')||'null');return d?.session_id&&Array.isArray(d.lines)?d:null}catch{return null}}
 function persist(){if(draft)localStorage.setItem('ht_shelf_draft',JSON.stringify(draft));else localStorage.removeItem('ht_shelf_draft')}
 function tell(t){$('message').textContent=t;$('message').classList.toggle('hidden',!t)}
 function element(tag,text,cls){const el=document.createElement(tag);if(text!==undefined)el.textContent=text;if(cls)el.className=cls;return el}
-async function api(path,method='GET',body,signal){const controller=new AbortController();const abort=()=>controller.abort();signal?.addEventListener('abort',abort,{once:true});const timer=setTimeout(abort,90000);try{const r=await fetch(path,{method,headers:{Authorization:'Bearer '+token,...(body?{'Content-Type':'application/json'}:{})},body:body?JSON.stringify(body):undefined,signal:controller.signal});const data=await r.json();if(!r.ok){const error=new Error(typeof data.detail==='string'?data.detail:'Request failed ('+r.status+'). Retry when connected.');error.status=r.status;throw error}return data}catch(e){if(e.name==='AbortError')throw new Error('The request timed out or was stopped. Retry when connected.');throw e}finally{clearTimeout(timer);signal?.removeEventListener('abort',abort)}}
+async function api(path,method='GET',body,signal){const controller=new AbortController();const abort=()=>controller.abort();signal?.addEventListener('abort',abort,{once:true});const timer=setTimeout(abort,90000);try{const r=await fetch(path,{method,headers:{Authorization:'Bearer '+token,...(body?{'Content-Type':'application/json'}:{})},body:body?JSON.stringify(body):undefined,signal:controller.signal});const data=await r.json();if(!r.ok){const error=new Error(typeof data.detail==='string'?data.detail:(data.detail?.message||'Request failed ('+r.status+'). Retry when connected.'));error.status=r.status;error.detail=data.detail;throw error}return data}catch(e){if(e.name==='AbortError')throw new Error('The request timed out or was stopped. Retry when connected.');throw e}finally{clearTimeout(timer);signal?.removeEventListener('abort',abort)}}
 function updateControls(){const locked=actionBusy||!!draft?.pending_commit;$('startLive').disabled=locked||live;$('photoButton').disabled=locked||live;$('reviewView').disabled=locked||!resultImage;$('retryAnalysis').disabled=locked;$('addManual').disabled=locked||!captureRecord;$('refreshPhotos').disabled=locked;$('deletePhoto').disabled=locked||!captureRecord?.uploaded;document.querySelectorAll('#history button').forEach(button=>button.disabled=locked);$('newShelf').disabled=actionBusy;$('location').disabled=!!draft;$('operator').disabled=!!draft;$('finishShelf').disabled=actionBusy||!draft?.lines.length||(!$('confirmed').checked&&!draft?.pending_commit);$('finishShelf').textContent=draft?.pending_commit?'Retry saving this shelf':'Save shelf & sync Sheets'}
 function setBusy(value){actionBusy=value;updateControls()}
 function ensureShelf(){if(draft?.pending_commit)throw new Error('Retry saving this shelf before making another count.');if(!draft){const location=$('location').value.trim(),operator=$('operator').value.trim();if(!location||!operator)throw new Error('Enter a shelf location and your name first.');draft={session_id:crypto.randomUUID(),location,operator,lines:[]};persist();updateControls()}return draft}
@@ -54,7 +55,7 @@ function frame(){const video=$('video');if(!video.videoWidth||!video.videoHeight
 function changed(a,b){if(!a||!b)return true;let total=0;for(let i=0;i<a.length;i+=4)total+=Math.abs(a[i]-b[i])+Math.abs(a[i+1]-b[i+1])+Math.abs(a[i+2]-b[i+2]);return total/(a.length/4*3)>9}
 async function startLive(){try{ensureShelf();if(!navigator.mediaDevices?.getUserMedia)throw new Error('Live camera is unavailable here. Open this HTTPS page in Chrome on your phone, or choose a photo.');setBusy(true);stream=await navigator.mediaDevices.getUserMedia({video:{facingMode:{ideal:'environment'},width:{ideal:1600},height:{ideal:1200}},audio:false});$('video').srcObject=stream;await $('video').play();live=true;const run=++liveRun;lastPixels=null;$('stopLive').classList.remove('hidden');tell('');setBusy(false);liveTick(run)}catch(e){stopCamera();tell(e.name==='NotAllowedError'?'Camera permission was denied. Allow camera access for this site, then retry.':e.message);setBusy(false)}}
 async function liveTick(run){if(!live||run!==liveRun)return;try{const view=frame();if(changed(view.pixels,lastPixels)){$('liveBadge').textContent='ANALYZING THIS VIEW…';liveController=new AbortController();const analysis=await api('/api/vision/preview','POST',{image_base64:view.image.split(',')[1]},liveController.signal);if(!live||run!==liveRun)return;lastPixels=view.pixels;result=analysis;resultImage=view.image;captureRecord=null;renderResult(true);$('liveBadge').textContent='LIVE · SUGGESTIONS READY'}else $('liveBadge').textContent='LIVE · MOVE TO A NEW VIEW';if(live&&run===liveRun)liveTimer=setTimeout(()=>liveTick(run),8000)}catch(e){if(live&&run===liveRun){stopCamera();tell('Live AI paused: '+e.message)}}}
-function renderResult(isPreview=false){$('resultImage').src=resultImage;$('resultImage').classList.toggle('hidden',!resultImage);$('resultTime').textContent=new Date().toLocaleTimeString();$('resultHint').textContent=result?.scene_note||(resultImage?'Photo saved. Analyze it now, or enter a reviewed count.':'Start live video or choose a photo to get a suggested count.');$('proposals').replaceChildren();$('reviewView').classList.toggle('hidden',!isPreview||!resultImage);$('retryAnalysis').classList.toggle('hidden',!captureRecord);$('addManual').classList.toggle('hidden',!captureRecord);$('deletePhoto').classList.toggle('hidden',!captureRecord?.uploaded);if(result?.status==='needs_review'&&!result.proposals?.length)$('proposals').append(element('p','No reliably countable packs were found. Move closer to the labels or enter a checked quantity.'));for(const p of result?.proposals||[]){const item=catalog.find(i=>i.sku===p.sku);const card=element('div',undefined,'proposal');card.append(element('h3',item?.name||p.label),element('div',p.visible_packs===null?'Count needs checking':p.visible_packs+' visible packs','quantity'),element('p',p.evidence_text,'small'));if(p.question)card.append(element('p',p.question));const button=element('button',isPreview?'Review this view first':'Review quantity','secondary');button.type='button';button.onclick=()=>isPreview?freezeView():openCount(p);card.append(button);$('proposals').append(card)}updateControls()}
+function renderResult(isPreview=false){$('resultImage').src=resultImage;$('resultImage').classList.toggle('hidden',!resultImage);$('resultTime').textContent=new Date().toLocaleTimeString();$('resultHint').textContent=result?.scene_note||(resultImage?'Photo saved. Analyze it now, or enter a reviewed count.':'Start live video or choose a photo to get a suggested count.');$('proposals').replaceChildren();$('reviewView').classList.toggle('hidden',!isPreview||!resultImage);$('retryAnalysis').classList.toggle('hidden',!captureRecord);$('addManual').classList.toggle('hidden',!captureRecord);$('deletePhoto').classList.toggle('hidden',!captureRecord?.uploaded);if(result?.status==='needs_review'&&!result.proposals?.length)$('proposals').append(element('p','No reliably countable packs were found. Move closer to the labels or enter a checked quantity.'));for(const p of result?.proposals||[]){const item=catalog.find(i=>i.sku===p.sku);const card=element('div',undefined,'proposal');card.append(element('h3',item?.name||p.label),element('div',p.visible_packs===null?'Count needs checking':p.visible_packs+' visible packs','quantity'),element('p',p.evidence_text,'small'));if(p.question)card.append(element('p',p.question));if(!item)card.append(element('p','Not matched to the catalogue. Choose a closest match or add a new item.','small'));const button=element('button',isPreview?'Review this view first':item?'Review quantity':'Match or add item','secondary');button.type='button';button.onclick=()=>isPreview?freezeView():openCount(p);card.append(button);$('proposals').append(card)}updateControls()}
 async function imageFromFile(file){if(!file)return null;if(!file.type.startsWith('image/'))throw new Error('Choose an image file.');if(file.size>25000000)throw new Error('Choose a photo smaller than 25 MB.');const url=URL.createObjectURL(file);try{const img=new Image();img.src=url;await img.decode();const scale=Math.min(1,1600/Math.max(img.naturalWidth,img.naturalHeight));const canvas=document.createElement('canvas');canvas.width=Math.round(img.naturalWidth*scale);canvas.height=Math.round(img.naturalHeight*scale);canvas.getContext('2d').drawImage(img,0,0,canvas.width,canvas.height);return canvas.toDataURL('image/jpeg',.87)}finally{URL.revokeObjectURL(url)}}
 async function saveView(){const shelf=ensureShelf();if(!captureRecord)captureRecord={id:crypto.randomUUID(),session_id:shelf.session_id,location:shelf.location,operator:shelf.operator,captured_at:new Date().toISOString(),uploaded:false};if(!captureRecord.uploaded){await api('/api/captures','POST',{id:captureRecord.id,session_id:captureRecord.session_id,location:captureRecord.location,operator:captureRecord.operator,captured_at:captureRecord.captured_at,image_base64:resultImage.split(',')[1],ocr:'',barcodes:[]});captureRecord.uploaded=true}return captureRecord}
 async function analyzeSaved(){if(actionBusy)return;setBusy(true);try{await saveView();$('resultHint').textContent='Analyzing the saved photo…';result=await api('/api/captures/'+captureRecord.id+'/analyze','POST');renderResult();if(result.status!=='needs_review')tell(result.scene_note);else tell('Suggestions ready. Review each item and its unit before saving.');await loadRecent()}catch(e){tell(e.message);renderResult()}finally{setBusy(false)}}
@@ -62,11 +63,102 @@ async function freezeView(){if(actionBusy||!resultImage)return;stopCamera();awai
 async function choosePhoto(file){if(actionBusy||!file)return;try{ensureShelf();stopCamera();setBusy(true);resultImage=await imageFromFile(file);result=null;captureRecord=null;renderResult();setBusy(false);await analyzeSaved()}catch(e){tell(e.message);setBusy(false)}finally{$('photoInput').value=''}}
 async function loadCapture(c){if(actionBusy)return;if(draft&&draft.session_id!==c.session_id&&draft.lines.length){tell('Save the current shelf before opening a photo from another shelf.');return}if(draft?.pending_commit){tell('Retry saving the pending shelf first.');return}stopCamera();setBusy(true);try{const r=await fetch('/api/evidence/'+c.id,{headers:{Authorization:'Bearer '+token}});if(!r.ok)throw new Error('Could not load this photo. Reconnect and retry.');const blob=await r.blob();resultImage=await new Promise((resolve,reject)=>{const reader=new FileReader();reader.onload=()=>resolve(reader.result);reader.onerror=reject;reader.readAsDataURL(blob)});if(!draft||draft.session_id!==c.session_id){draft={session_id:c.session_id,location:c.location,operator:c.operator,lines:[]};persist()}captureRecord={...c,uploaded:true};result=c.analysis;restoreShelf();renderResult();tell(c.analysis_error||(!c.analysis?'This photo is uploaded but has no AI result. Tap Retry AI analysis.':''))}catch(e){tell(e.message)}finally{setBusy(false)}}
 function suggestQuantity(item,p){const n=p?.visible_packs;if(n===null||n===undefined)return '';const unit=(item.unit||'').toLowerCase();if(item.pack_size&&item.pack_unit===item.unit)return String(n*item.pack_size);if(['','pcs','packs','bags','boxes','cases','cans','bottles','jars','tins'].includes(unit))return String(n);return ''}
-function fillItems(selected=''){const q=$('itemSearch').value.trim().toLowerCase();$('item').replaceChildren(new Option('Choose the exact item',''));for(const item of catalog.filter(i=>i.sku===selected||i.name.toLowerCase().includes(q)||i.sku.toLowerCase().includes(q)))$('item').add(new Option(item.name+' · '+item.sku,item.sku));$('item').value=selected}
+function nameKey(value){return value.normalize('NFKD').replace(/\p{M}/gu,'').toLowerCase().replace(/[^\p{L}\p{N}]+/gu,' ').trim()}
+function wordSimilarity(a,b){
+ if(a===b)return 1;
+ if(!a||!b)return 0;
+ let row=Array.from({length:b.length+1},(_,i)=>i);
+ for(let i=1;i<=a.length;i++){const next=[i];for(let j=1;j<=b.length;j++)next[j]=Math.min(next[j-1]+1,row[j]+1,row[j-1]+(a[i-1]===b[j-1]?0:1));row=next}
+ return 1-row[b.length]/Math.max(a.length,b.length);
+}
+function closestItems(query){
+ const q=nameKey(query);if(q.length<2)return [];
+ const words=q.split(' ');
+ return catalog.map(item=>{
+  const name=nameKey(item.name),tokens=name.split(' ');
+  const tokenScore=words.reduce((total,word)=>total+Math.max(...tokens.map(token=>wordSimilarity(word,token))),0)/words.length;
+  let score=Math.max(wordSimilarity(q,name)*.8,tokenScore*.85);
+  if(name.includes(q))score=Math.max(score,.94);
+  if(name===q||nameKey(item.sku)===q)score=1;
+  return {item,score};
+ }).filter(match=>match.score>=.48).sort((a,b)=>b.score-a.score||a.item.name.localeCompare(b.item.name)).slice(0,3).map(match=>match.item);
+}
+function matchButtons(target,items){
+ $(target).replaceChildren();
+ for(const item of items){
+  const button=element('button','Use existing: '+item.name+' · '+(item.unit||'unit needs review'),'secondary');
+  button.type='button';button.disabled=itemSaving;button.onclick=()=>chooseCatalogItem(item);$(target).append(button);
+ }
+}
+function fillItems(selected=''){
+ const q=nameKey($('itemSearch').value),matches=closestItems(q),ids=new Set(matches.map(item=>item.sku));
+ $('item').replaceChildren(new Option('Choose the exact item',''));
+ for(const item of catalog.filter(i=>!q||i.sku===selected||ids.has(i.sku)||nameKey(i.name).includes(q)||nameKey(i.sku).includes(q)))$('item').add(new Option(item.name+' · '+item.sku,item.sku));
+ $('item').value=selected;
+ const exact=catalog.some(item=>nameKey(item.name)===q);
+ $('matchHint').textContent=!q?'Search for an item, or add it if it is missing.':matches.length?(exact?'Existing catalogue matches.':'No exact name found. Closest matches:')+' Choose only if the item, brand and pack size match.':'No close matches found. Check the spelling or add a new item.';
+ matchButtons('itemMatches',matches);
+}
 function itemChanged(){const item=catalog.find(i=>i.sku===$('item').value);$('unit').value=item?.unit||'packs';$('unit').readOnly=!!item?.unit;$('quantity').value=item?suggestQuantity(item,proposalDraft):''}
-function openCount(p=null,line=null){if(actionBusy||draft?.pending_commit||!captureRecord?.uploaded){tell('Save this view as evidence before entering a final count.');return}stopCamera();proposalDraft=p;$('itemSearch').value='';fillItems(line?.sku||p?.sku||'');itemChanged();$('method').value=line?.source||'visual_confirmed';$('note').value=line?.note||'';$('voiceStatus').textContent='';if(line){$('quantity').value=line.quantity;$('unit').value=line.unit}$('countDialog').showModal()}
+function chooseCatalogItem(item){
+ if(itemSaving||actionBusy)return;
+ const old=catalog.find(i=>i.sku===item.sku);if(old)Object.assign(old,item);else catalog.push(item);
+ $('newItemDialog').close();$('itemSearch').value=item.name;fillItems(item.sku);itemChanged();
+ $('itemStatus').textContent='Selected '+item.name+'. Check its unit and final quantity.';
+}
+function newItemMessage(text){$('newItemStatus').textContent=text;$('newItemStatus').classList.toggle('hidden',!text)}
+function updateNewItemMatches(){
+ const name=$('newItemName').value.trim(),matches=closestItems(name);
+ if(newItemConflict&&!matches.some(i=>i.sku===newItemConflict.sku))matches.unshift(newItemConflict);
+ matchButtons('newItemMatches',matches.slice(0,3));
+ const exact=catalog.some(item=>nameKey(item.name)===nameKey(name));
+ $('newItemMatchHint').textContent=exact?'This name is already listed. Use the existing item, or enter a distinct name for a different brand or pack.':matches.length?'Check these existing items before adding a new one.':'No close matches found.';
+ $('createItem').disabled=itemSaving||!nameKey(name)||!$('newItemUnit').value.trim()||!$('newItemCategory').value.trim()||exact;
+}
+function openNewItem(){
+ if(actionBusy||draft?.pending_commit||!captureRecord?.uploaded)return;
+ recognition?.abort();newItemSku='HT-'+crypto.randomUUID();newItemConflict=null;
+ $('newItemName').value=($('itemSearch').value.trim()||proposalDraft?.label||'').slice(0,200);
+ $('newItemUnit').value='';$('newItemCategory').value='Other';newItemMessage('');
+ $('itemCategories').replaceChildren();
+ for(const category of [...new Set(catalog.map(i=>i.category||'Other'))].sort())$('itemCategories').append(new Option(category,category));
+ updateNewItemMatches();$('newItemDialog').showModal();$('newItemName').focus();
+}
+function setItemSaving(value){
+ itemSaving=value;setBusy(value);
+ for(const id of ['newItemName','newItemUnit','newItemCategory','cancelNewItem'])$(id).disabled=value;
+ $('createItem').textContent=value?'Adding item…':'Add item & use it';updateNewItemMatches();
+}
+async function createCatalogItem(e){
+ e.preventDefault();if(itemSaving||actionBusy||!captureRecord?.uploaded)return;
+ const name=$('newItemName').value.trim(),unit=$('newItemUnit').value.trim(),category=$('newItemCategory').value.trim();
+ if(!nameKey(name)||!unit||!category){newItemMessage('Enter the item name, counting unit and category.');return}
+ if(catalog.some(i=>nameKey(i.name)===nameKey(name))){newItemMessage('This name is already in the catalogue. Choose Use existing above.');return}
+ const body={sku:newItemSku,name,unit,category,reference_photo:captureRecord.id,source:'Browser inventory'};
+ setItemSaving(true);newItemMessage('Saving the new item…');let saved=null,message='';
+ try{
+  saved=await api('/api/items','POST',body);
+  const old=catalog.find(i=>i.sku===saved.sku);if(old)Object.assign(old,saved);else catalog.push(saved);
+  newItemMessage('Item saved. Updating Google Sheets…');
+  try{await api('/api/sheets/sync','POST');message='Item added to the catalogue and Google Sheets. Review its final quantity below.'}
+  catch(error){message='Item added to the catalogue. Sheets sync needs retry: '+error.message+' Saving the shelf will retry sync.'}
+ }catch(error){
+  if(error.detail?.existing_item){newItemConflict=error.detail.existing_item;const old=catalog.find(i=>i.sku===newItemConflict.sku);if(old)Object.assign(old,newItemConflict);else catalog.push(newItemConflict)}
+  newItemMessage(error.message);
+ }finally{setItemSaving(false)}
+ if(saved){chooseCatalogItem(saved);$('itemStatus').textContent=message}
+}
+function openCount(p=null,line=null){
+ if(actionBusy||draft?.pending_commit||!captureRecord?.uploaded){tell('Save this view as evidence before entering a final count.');return}
+ stopCamera();proposalDraft=p;$('itemStatus').textContent='';
+ const selected=line?.sku||(catalog.some(i=>i.sku===p?.sku)?p.sku:'');
+ $('itemSearch').value=selected?'':(p?.label||'').slice(0,200);fillItems(selected);itemChanged();
+ $('method').value=line?.source||'visual_confirmed';$('note').value=line?.note||'';$('voiceStatus').textContent='';
+ if(line){$('quantity').value=line.quantity;$('unit').value=line.unit}$('countDialog').showModal();
+}
+
 function renderLines(){$('lines').replaceChildren();if(!draft?.lines.length)$('lines').append(element('p','No confirmed counts yet.'));for(const line of draft?.lines||[]){const div=element('div',undefined,'line');div.append(element('h3',catalog.find(i=>i.sku===line.sku)?.name||line.sku),element('p',line.quantity+' '+line.unit));const remove=element('button','Remove','secondary');remove.type='button';remove.disabled=actionBusy||!!draft.pending_commit;remove.onclick=()=>{draft.lines=draft.lines.filter(x=>x.sku!==line.sku);$('confirmed').checked=false;persist();renderLines();updateControls()};div.append(remove);$('lines').append(div)}updateControls()}
-function saveLine(e){e.preventDefault();const item=catalog.find(i=>i.sku===$('item').value);const quantity=Number($('quantity').value),unit=$('unit').value.trim();if(!item||$('quantity').value===''||!Number.isFinite(quantity)||quantity<0||quantity>1e9||!unit)return;if(item.unit&&unit!==item.unit){tell('Use the catalogue unit for this item.');return}const line={sku:item.sku,quantity,unit,source:$('method').value,evidence_ids:[captureRecord.id],note:$('note').value};draft.lines=draft.lines.filter(x=>x.sku!==line.sku).concat(line);$('confirmed').checked=false;persist();renderLines();$('countDialog').close()}
+function saveLine(e){e.preventDefault();if(actionBusy)return;const item=catalog.find(i=>i.sku===$('item').value);const quantity=Number($('quantity').value),unit=$('unit').value.trim();if(!item||$('quantity').value===''||!Number.isFinite(quantity)||quantity<0||quantity>1e9||!unit)return;if(item.unit&&unit!==item.unit){tell('Use the catalogue unit for this item.');return}const line={sku:item.sku,quantity,unit,source:$('method').value,evidence_ids:[captureRecord.id],note:$('note').value};draft.lines=draft.lines.filter(x=>x.sku!==line.sku).concat(line);$('confirmed').checked=false;persist();renderLines();$('countDialog').close()}
 async function finishShelf(){if(actionBusy||!draft?.lines.length||(!$('confirmed').checked&&!draft.pending_commit))return;stopCamera();setBusy(true);renderLines();try{if(!draft.pending_commit){draft.pending_commit={id:crypto.randomUUID(),session_id:draft.session_id,location:draft.location,operator:draft.operator,counted_at:new Date().toISOString(),review_confirmed:true,lines:structuredClone(draft.lines)};persist()}$('saving').textContent='Saving reviewed counts…';for(const line of draft.pending_commit.lines){const item=catalog.find(i=>i.sku===line.sku);if(item&&!item.unit){const saved=await api('/api/items/'+encodeURIComponent(item.sku),'PUT',{...item,unit:line.unit});Object.assign(item,saved)}}await api('/api/commits','POST',draft.pending_commit);draft=null;persist();captureRecord=null;result=null;resultImage='';$('confirmed').checked=false;renderResult();renderLines();$('saving').textContent='Counts saved. Syncing Google Sheets…';try{await api('/api/sheets/sync','POST');$('saving').textContent='Shelf saved. Google Sheets updated.'}catch(e){$('saving').textContent='Counts are saved. Sheets sync needs retry: '+e.message}tell('Shelf saved. Enter your next shelf location to continue.')}catch(e){tell(e.message);if(e.status===422&&draft){delete draft.pending_commit;persist();$('confirmed').checked=false;$('saving').textContent='Counts were not saved. Correct or remove the affected count, then review and save again.'}else $('saving').textContent='Not confirmed saved. Retry uses the same count ID to prevent duplicates.'}finally{setBusy(false);renderLines()}}
 function voiceQuantity(text){
  const lower=text.toLowerCase();
@@ -86,6 +178,12 @@ function voiceQuantity(text){
  return total;
 }
 function speak(){const Speech=window.SpeechRecognition||window.webkitSpeechRecognition;if(!Speech){$('voiceStatus').textContent='Voice is unavailable in this browser. Use the keyboard microphone or type the quantity.';return}recognition?.abort();recognition=new Speech();recognition.lang='en-US';recognition.interimResults=false;recognition.onresult=e=>{const text=e.results[0][0].transcript,n=voiceQuantity(text);$('voiceStatus').textContent='Heard: '+text+'. Check the quantity before saving.';$('quantity').value=n===null?'':n;if(n===null)$('voiceStatus').textContent='Heard: '+text+'. Say one quantity or type it below.';$('method').value='operator_reported';$('note').value=('Voice clarification: '+text).slice(0,2000)};recognition.onerror=()=>{$('voiceStatus').textContent='Voice could not be heard. Try again or enter the quantity.'};recognition.start();$('voiceStatus').textContent='Listening…'}
-$('login').onsubmit=e=>{e.preventDefault();token=$('token').value.trim();connect()};$('startLive').onclick=startLive;$('stopLive').onclick=stopCamera;$('photoButton').onclick=()=>{try{ensureShelf();$('photoInput').click()}catch(e){tell(e.message)}};$('photoInput').onchange=e=>choosePhoto(e.target.files[0]);$('reviewView').onclick=freezeView;$('retryAnalysis').onclick=analyzeSaved;$('refreshPhotos').onclick=()=>loadRecent().catch(e=>tell(e.message));$('addManual').onclick=()=>openCount();$('deletePhoto').onclick=()=>deletePhoto(captureRecord);$('confirmed').onchange=updateControls;$('finishShelf').onclick=finishShelf;$('itemSearch').oninput=()=>fillItems($('item').value);$('item').onchange=itemChanged;$('countForm').onsubmit=saveLine;$('cancelCount').onclick=()=>{$('countDialog').close();recognition?.abort()};$('voice').onclick=speak;$('newShelf').onclick=()=>{if(actionBusy)return;if(draft?.pending_commit){tell('Retry saving the pending shelf before starting another.');return}if(draft?.lines.length&&!confirm('Discard these unsaved final counts and start another shelf? Uploaded photos will remain.'))return;stopCamera();draft=null;persist();captureRecord=null;result=null;resultImage='';$('confirmed').checked=false;renderResult();renderLines();updateControls();$('location').value='';$('location').focus()};
+$('login').onsubmit=e=>{e.preventDefault();token=$('token').value.trim();connect()};$('startLive').onclick=startLive;$('stopLive').onclick=stopCamera;$('photoButton').onclick=()=>{try{ensureShelf();$('photoInput').click()}catch(e){tell(e.message)}};$('photoInput').onchange=e=>choosePhoto(e.target.files[0]);$('reviewView').onclick=freezeView;$('retryAnalysis').onclick=analyzeSaved;$('refreshPhotos').onclick=()=>loadRecent().catch(e=>tell(e.message));$('addManual').onclick=()=>openCount();$('deletePhoto').onclick=()=>deletePhoto(captureRecord);$('confirmed').onchange=updateControls;$('finishShelf').onclick=finishShelf;$('itemSearch').oninput=()=>{fillItems();itemChanged();$('itemStatus').textContent=''};$('item').onchange=itemChanged;$('countForm').onsubmit=saveLine;$('cancelCount').onclick=()=>{if(!actionBusy){$('countDialog').close();recognition?.abort()}};$('voice').onclick=speak;$('newShelf').onclick=()=>{if(actionBusy)return;if(draft?.pending_commit){tell('Retry saving the pending shelf before starting another.');return}if(draft?.lines.length&&!confirm('Discard these unsaved final counts and start another shelf? Uploaded photos will remain.'))return;stopCamera();draft=null;persist();captureRecord=null;result=null;resultImage='';$('confirmed').checked=false;renderResult();renderLines();updateControls();$('location').value='';$('location').focus()};
+$('addNewItem').onclick=openNewItem;$('newItemForm').onsubmit=createCatalogItem;
+$('newItemName').oninput=()=>{newItemConflict=null;newItemMessage('');updateNewItemMatches()};
+$('newItemUnit').oninput=updateNewItemMatches;$('newItemCategory').oninput=updateNewItemMatches;
+$('cancelNewItem').onclick=()=>{if(!itemSaving)$('newItemDialog').close()};
+$('newItemDialog').addEventListener('cancel',e=>{if(itemSaving)e.preventDefault()});
+$('countDialog').addEventListener('cancel',e=>{if(itemSaving)e.preventDefault();else recognition?.abort()});
 document.addEventListener('visibilitychange',()=>{if(document.hidden)stopCamera()});window.addEventListener('pagehide',()=>{stopCamera();recognition?.abort()});window.addEventListener('beforeunload',e=>{if(draft?.lines.length){e.preventDefault();e.returnValue=''}});
 if(token)connect();

@@ -47,3 +47,7 @@ Run backend tests with `cd backend && python -m unittest discover -s tests -v`. 
 
 ## Delete an uploaded photo (0.2.1)
 Open `/capture`, connect, then choose **Delete photo** in **Uploaded photos** or beside the currently reviewed photo. Confirm the location and time before deleting. Saved stock quantities remain unchanged; unsaved counts using that photo are removed from this browser draft. The app also updates Google Sheets, or displays a sync-retry message. Copies in the phone gallery or original Android app remain on the phone. This update does not require an APK reinstall.
+
+
+## Match or add a missing item (0.2.2)
+When a photo suggestion is not matched to the catalogue, select **Match or add item**. Review up to three close name matches, or choose **Add new item** and enter its name, counting unit and category. Manual item searches offer the same options. The new item is saved to the app catalogue and **HT Items** in Google Sheets; review the quantity and save the shelf to update stock. Duplicate names are flagged for explicit selection of the existing item. This is available in the browser at `/capture`; the original APK is unchanged.
